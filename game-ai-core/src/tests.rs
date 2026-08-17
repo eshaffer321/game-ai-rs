@@ -56,13 +56,10 @@ impl Game for NimGame {
         (state.pile, state.to_move as u8)
     }
 
-    fn evaluate(state: &Self::State) -> i32 {
-        // Trivial: prefer leaving a multiple of 3 for the opponent.
-        if state.pile % 3 == 0 {
-            -1
-        } else {
-            1
-        }
+    fn tt_hash(key: &Self::PositionKey) -> u64 {
+        // A toy deterministic mix -- not fmix64, just distinct from a
+        // plain cast so the "hash != key" distinction is exercised.
+        ((key.0 as u64) << 8 | key.1 as u64).wrapping_mul(0x9E3779B97F4A7C15)
     }
 }
 
@@ -97,6 +94,13 @@ fn position_key_distinguishes_every_reachable_state() {
             assert!(seen.insert(NimGame::position_key(&state)), "duplicate key for {state:?}");
         }
     }
+}
+
+#[test]
+fn tt_hash_is_deterministic_across_calls() {
+    let state = NimState { pile: 4, to_move: NimPlayer::B };
+    let key = NimGame::position_key(&state);
+    assert_eq!(NimGame::tt_hash(&key), NimGame::tt_hash(&key));
 }
 
 #[test]

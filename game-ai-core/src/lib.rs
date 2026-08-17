@@ -4,12 +4,21 @@
 //! rationale behind each piece of this trait and what's deliberately
 //! left out of it.
 
-use std::hash::Hash;
-
 /// Implementors are zero-sized marker types (e.g. `pub struct
 /// OnitamaGame;`) -- every method is a plain associated function, so a
 /// generic search function (`fn negamax<G: Game>(...)`) monomorphizes
 /// per game with no `dyn Game` and no dynamic dispatch per node.
+///
+/// Deliberately *not* here: evaluation, or any tactical classification
+/// (captures, "noisy" moves, immediate threats) a search technique
+/// might need. A rules engine is not an evaluator -- Onifish's
+/// evaluator carries runtime-configurable `EvalWeights` that a static
+/// associated function on this trait could never preserve, and a
+/// different game may want a completely different evaluator without
+/// touching its rules at all. Those live in `game_ai_alphabeta::
+/// SearchHooks`, a separate, per-game, monomorphized object the
+/// search actually runs against -- see that trait's doc comment and
+/// DESIGN.md.
 pub trait Game {
     type State: Copy;
     type Move: Copy + Eq;
@@ -18,7 +27,7 @@ pub trait Game {
     /// though it need not be a *minimal* encoding). Not required to
     /// equal `State` itself -- see DESIGN.md's note on Onitama's
     /// existing bit-packed key.
-    type PositionKey: Copy + Eq + Hash;
+    type PositionKey: Copy + Eq;
 
     /// Whose turn it is to move in `state`.
     fn current_player(state: &Self::State) -> Self::Player;
@@ -45,11 +54,21 @@ pub trait Game {
     /// share a key.
     fn position_key(state: &Self::State) -> Self::PositionKey;
 
-    /// Static evaluation of `state`, from `current_player(state)`'s
-    /// perspective. Higher is better for the player to move. Never
-    /// called by a well-behaved search on a state where `result` is
-    /// not `InProgress`.
-    fn evaluate(state: &Self::State) -> i32;
+    /// A **deterministic** hash of `key`, used only to pick a slot in
+    /// a bounded transposition table -- never to distinguish
+    /// positions on its own (a TT entry still stores the full
+    /// `PositionKey` and compares it exactly on probe, so a `tt_hash`
+    /// collision only costs a wasted or overwritten slot, never a
+    /// wrong result). Must be stable run to run: `std`'s default
+    /// `Hash`/`Hasher` is explicitly unsuitable here (its
+    /// `RandomState` seed varies per process), which is why this is a
+    /// dedicated method rather than a `Hash` bound on `PositionKey`.
+    /// Onitama's implementation must reproduce Onifish's exact
+    /// existing mixing (a folded fmix64 finalizer) bit for bit --
+    /// changing it changes which positions collide in the table,
+    /// which changes node counts and PVs even though the search
+    /// itself is unchanged, breaking the frozen-position replay gate.
+    fn tt_hash(key: &Self::PositionKey) -> u64;
 }
 
 /// The outcome of a game at a given state. `Draw` has no producer in
