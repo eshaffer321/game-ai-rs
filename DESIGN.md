@@ -97,10 +97,25 @@ Why each piece is shaped the way it is:
 
 ```rust
 pub trait SearchHooks<G: Game> {
+    const HISTORY_BUCKETS: usize;
+
     fn evaluate(&self, state: &G::State) -> i32;
-    fn is_noisy(&self, state: &G::State, mv: &G::Move) -> bool;
+    fn move_features(&self, state: &G::State, mv: &G::Move) -> MoveFeatures;
     fn has_immediate_threat(&self, state: &G::State, player: G::Player) -> bool;
-    fn history_index(&self, mv: &G::Move) -> (usize, usize);
+}
+
+pub struct MoveFeatures {
+    pub priority: MovePriority,
+    pub is_noisy: bool,
+    pub is_capture: bool,
+    pub history_bucket: Option<usize>,
+}
+
+pub enum MovePriority {
+    ImmediateWin,
+    Capture,
+    Ordinary,
+    Pass,
 }
 ```
 
@@ -114,12 +129,44 @@ of `Game` and moved here instead:
   `SearchHooks` implementor is an ordinary struct (`OnitamaHooks {
   weights: EvalWeights }`), built once per player and holding whatever
   state its evaluator needs.
-- **Noisy/capture/immediate-win classification**, for quiescence.
+- **`move_features`, one call per move, not several methods that each
+  have to independently agree.** An earlier draft split this into
+  `is_noisy(state, mv) -> bool` and `history_index(mv) -> (usize,
+  usize)`. Nothing forced those two to agree with each other about
+  what a move *is* -- and in fact they didn't: Onitama's `Move::Pass`
+  has no board squares to index by, but the two-method version mapped
+  it to a placeholder `(0, 0)`, which is a real, valid bucket for an
+  actual `Step { from: 0, to: 0, .. }`-shaped move. A pass and a real
+  quiet move could silently share history, corrupting move ordering in
+  a way no test caught until this was reviewed against the real
+  engine's exact history-recording predicate. `MoveFeatures` fixes
+  this by returning everything about one move as a single value:
+  - `priority`: the coarse ordering tier -- immediate wins, then
+    captures, then everything else, then a pass last (for games that
+    have one; others simply never produce that variant).
+  - `is_noisy`: for quiescence. Not always `priority == Capture`:
+    Onitama treats an immediate win as noisy too, whether or not it
+    also happens to capture something.
+  - `is_capture`: kept separate from `priority` because a priority
+    *tier* can't recover it on its own -- capturing the opponent's
+    master is `ImmediateWin` **and** a capture; walking the master onto
+    the opponent's temple is `ImmediateWin` but **not** a capture.
+  - `history_bucket: Option<usize>`: `None` means "never record this
+    move in the history table" -- which now precisely reproduces
+    Onifish's actual gate (`if !is_capture { record }`), including the
+    edge case that gate does *not* exclude: a non-capturing immediate
+    win (the temple-walk case) still gets a bucket, exactly like the
+    existing engine, because `history_bucket` is derived from
+    `is_capture` specifically, not from `priority` or `is_noisy`. And
+    `None` unconditionally for a pass, closing the exact gap above.
+- **A single declared `HISTORY_BUCKETS: usize`, not a `(usize,
+  usize)` shape.** Onitama's is `25 * 25 = 625` -- still a flat
+  `(from, to)` mapping under the hood, just pre-flattened by the
+  implementor, so a game whose moves don't decompose into two
+  independent indices (Santorini's `Turn { to, build }` is close but
+  not quite the same shape as Onitama's `(from, to)`) isn't forced to
+  invent a second dimension it doesn't have.
 - **Immediate-threat detection**, for gating late-move reductions.
-- **History-table indexing**, since a quiet move's `(from, to)`-style
-  bucket is move-representation-specific (Onitama: literal board
-  squares; a different game's moves might not decompose that way at
-  all).
 
 `SearchHooks` implementors are still ordinary generic type parameters,
 not `dyn` objects: `fn negamax<G: Game, H: SearchHooks<G>>(hooks: &H,
@@ -162,6 +209,23 @@ actual engine surfaced why they don't fit:
   mixing Onifish's existing TT already depends on for exact node-count
   and PV parity. Replaced by an explicit `Game::tt_hash`, above.
 
+A second pass, after both adapters implemented the first `SearchHooks`
+draft, found the `is_noisy`/`history_index` split described above
+(replaced by `move_features`/`MoveFeatures`, above) and a separate
+dependency-cycle problem on Onitama's side: the adapter reused
+Onifish's evaluator/position-key logic by depending on `onitama-ai`,
+which is exactly backwards once `onitama-ai` needs to depend on the
+migrated search engine *and* the adapter (`onitama-ai → adapter →
+onitama-ai`). Fixed on the Onitama side, not in this repo: the
+Onitama-specific domain logic (`EvalWeights`, `evaluate`,
+`is_capture`/`is_immediate_win`, `position_key`, the TT key-mixing
+function) moved out of `onitama-ai` into a new, lower crate
+(`onitama-search-domain`) that depends on `onitama-core` and this repo
+only -- `onitama-ai` now depends on *it* and re-exports what it needs,
+restoring a strict one-directional dependency order. See that crate's
+own history for the details; nothing in `game-ai-rs` itself needed to
+change for this fix.
+
 ## Repo layout
 
 ```text
@@ -179,12 +243,17 @@ game-ai-rs
 Game-specific adapters -- a marker type with its `Game` impl, plus a
 `SearchHooks` implementor carrying the game's own evaluator and
 tactical/"noisy move" classification -- live in each game's **own**
-repository (`onitama`, `santorini-rs`),
-depending on `game-ai-core`/`game-ai-alphabeta` via a **pinned Git
-revision**, never the reverse. No committed `path = "../..."`
-dependency ever crosses a repo boundary in the final arrangement: all
-three repositories must stay independently cloneable and buildable on
-their own.
+repository (`onitama`'s is `onitama-search-domain`; `santorini-rs`'s is
+`santorini-game-ai-adapter`), depending on `game-ai-core`/
+`game-ai-alphabeta` via a **pinned Git revision**, never the reverse.
+No committed `path = "../..."` dependency ever crosses a repo boundary
+in the final arrangement: all three repositories must stay
+independently cloneable and buildable on their own. On the Onitama
+side specifically, this adapter crate is also the *lowest* Onitama
+crate depending on this repo -- `onitama-ai` (the actual search
+engine, still unmigrated) depends on `onitama-search-domain`, not the
+other way around, so that a future `onitama-ai → game-ai-alphabeta`
+dependency never closes a cycle back through the adapter.
 
 ## Migration plan
 
@@ -198,19 +267,33 @@ Staged, per the acceptance gates that govern this extraction:
    genuinely different rules engines (Onitama's card-based movement
    and captures vs. Santorini's setup phase, king-move adjacency, and
    building), no search migrated yet.
-2a. **This commit**: revise the interface itself after that spike
-   surfaced two rules-vs-search leaks (evaluation needing to carry
-   `EvalWeights`; TT indexing needing to be deterministic, not
-   `std::hash`-based) -- see "Revision history" above. Both adapters'
-   `Game` impls updated (`tt_hash` added, reproducing Onifish's exact
-   mixing for Onitama), and both now also implement `SearchHooks` via
-   a small per-game hooks struct.
-3. Only once (2a) compiles cleanly for both games: migrate Onifish's
-   actual alpha-beta/TT/quiescence/move-ordering/diagnostics into
-   `game-ai-alphabeta`, generic over `G: Game, H: SearchHooks<G>`,
-   consuming the two adapters' existing `SearchHooks` implementors
-   directly rather than reaching into `onitama-ai` for
-   `is_capture`/`is_immediate_win`/`EvalWeights` by hand.
+2a. Revise the interface itself after that spike surfaced two
+   rules-vs-search leaks (evaluation needing to carry `EvalWeights`;
+   TT indexing needing to be deterministic, not `std::hash`-based) --
+   see "Revision history" above. Both adapters' `Game` impls updated
+   (`tt_hash` added, reproducing Onifish's exact mixing for Onitama),
+   and both now also implement `SearchHooks` via a small per-game
+   hooks struct.
+2b. **This commit**: a second interface pass, after (2a)'s
+   `SearchHooks` draft turned out unable to exactly express Onifish's
+   move-ordering behavior (see "Revision history"'s second paragraph)
+   -- `is_noisy`/`history_index` replaced by `move_features`/
+   `MoveFeatures`/`HISTORY_BUCKETS`. Separately (not a change to this
+   repo, but a precondition for step 3): the Onitama-side dependency
+   cycle is broken by extracting `onitama-search-domain`.
+3. Only once (2b) compiles cleanly for both games, and the Onitama
+   dependency graph has no cycle: migrate Onifish's actual alpha-beta/
+   TT/quiescence/move-ordering/diagnostics into `game-ai-alphabeta`,
+   generic over `G: Game, H: SearchHooks<G>`, consuming
+   `onitama-search-domain`'s `SearchHooks` implementor directly.
+   **Mechanical migration only** -- move the existing logic across,
+   don't clean it up algorithmically along the way, so any behavior
+   difference the frozen-position gate (step 4) catches has one
+   obvious cause, not "which of several simultaneous changes did it."
+   Run that gate after every meaningful slice of the migration, not
+   just once at the end -- and never edit the frozen fixture's
+   expected values to make a failing comparison pass; a mismatch means
+   the migration introduced a real behavior change to find and fix.
 4. Re-run the positions frozen in (1) against the migrated engine at
    the same fixed depths -- move, score, node count, and PV must match
    exactly.
@@ -218,12 +301,17 @@ Staged, per the acceptance gates that govern this extraction:
    (pre-migration) engine; must land within roughly 5% at equal depth.
 6. If anything in the actual hot path changed shape during migration
    (not just moved files), run a small equal-time arena control before
-   trusting the throughput comparison alone.
-7. Give Santorini a simple handcrafted evaluator, plug it into the
-   migrated `game-ai-alphabeta`, and confirm alpha-beta completes
-   legal games end to end (extending `santorini-core`'s existing
-   randomized-complete-game testing to run through the shared search
-   instead of random moves).
+   trusting the throughput comparison alone. Do this, and confirm
+   playing strength holds, **before** deleting the original
+   `onitama-ai::alphabeta` implementation -- it's the fallback if the
+   migrated version turns out to have a real regression the frozen
+   positions didn't happen to exercise.
+7. Only after Onitama's migration is fully validated: give Santorini a
+   simple handcrafted evaluator, plug it into the migrated
+   `game-ai-alphabeta`, and confirm alpha-beta completes legal games
+   end to end (extending `santorini-core`'s existing randomized-
+   complete-game testing to run through the shared search instead of
+   random moves).
 
 Steps 3-7 are the next phase of work -- not part of this commit, which
-only covers steps 1-2a.
+only covers steps 1-2b.

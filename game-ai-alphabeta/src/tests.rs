@@ -3,7 +3,7 @@
 
 use game_ai_core::{Game, GameResult};
 
-use crate::SearchHooks;
+use crate::{MoveFeatures, MovePriority, SearchHooks};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum NimPlayer {
@@ -69,20 +69,26 @@ struct NimHooks {
 }
 
 impl SearchHooks<NimGame> for NimHooks {
+    // Buckets 0..=2 index by "how much this move takes" -- a toy
+    // stand-in for Onitama's 625 (from, to) buckets.
+    const HISTORY_BUCKETS: usize = 3;
+
     fn evaluate(&self, state: &NimState) -> i32 {
         if state.pile.is_multiple_of(self.prefer_multiple_of) { -1 } else { 1 }
     }
 
-    fn is_noisy(&self, state: &NimState, mv: &u8) -> bool {
-        *mv as u16 >= state.pile as u16
+    fn move_features(&self, state: &NimState, mv: &u8) -> MoveFeatures {
+        let wins_immediately = *mv as u16 >= state.pile as u16;
+        MoveFeatures {
+            priority: if wins_immediately { MovePriority::ImmediateWin } else { MovePriority::Ordinary },
+            is_noisy: wins_immediately,
+            is_capture: false, // Nim has no captures
+            history_bucket: (!wins_immediately).then_some(*mv as usize),
+        }
     }
 
     fn has_immediate_threat(&self, state: &NimState, _player: NimPlayer) -> bool {
         state.pile <= 2
-    }
-
-    fn history_index(&self, mv: &u8) -> (usize, usize) {
-        (*mv as usize, *mv as usize)
     }
 }
 
@@ -98,11 +104,17 @@ fn search_hooks_dispatch_generically_with_no_dyn() {
 }
 
 #[test]
-fn is_noisy_flags_a_move_that_would_end_the_game() {
+fn move_features_flags_a_move_that_would_end_the_game() {
     let hooks = NimHooks { prefer_multiple_of: 3 };
-    let state = NimState { pile: 2, to_move: NimPlayer::A };
-    assert!(hooks.is_noisy(&state, &2));
-    assert!(!hooks.is_noisy(&NimState { pile: 5, to_move: NimPlayer::A }, &1));
+    let winning = hooks.move_features(&NimState { pile: 2, to_move: NimPlayer::A }, &2);
+    assert_eq!(winning.priority, MovePriority::ImmediateWin);
+    assert!(winning.is_noisy);
+    assert_eq!(winning.history_bucket, None);
+
+    let quiet = hooks.move_features(&NimState { pile: 5, to_move: NimPlayer::A }, &1);
+    assert_eq!(quiet.priority, MovePriority::Ordinary);
+    assert!(!quiet.is_noisy);
+    assert_eq!(quiet.history_bucket, Some(1));
 }
 
 #[test]
