@@ -15,7 +15,8 @@ rest of Onifish's search machinery.
 - `game-ai-core` -- the `Game` trait. No dependencies on any specific
   game.
 - `game-ai-alphabeta` -- iterative-deepening negamax generic over
-  `G: Game` (not yet migrated).
+  `G: Game, H: SearchHooks<G>`, mechanically ported from Onifish's
+  original engine.
 - `game-ai-arena` -- game-agnostic self-play/match tooling generic
   over `G: Game` (not yet built).
 

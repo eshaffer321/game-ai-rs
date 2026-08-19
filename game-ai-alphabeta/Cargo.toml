@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 game-ai-core = { path = "../game-ai-core" }
+web-time = "1.1"

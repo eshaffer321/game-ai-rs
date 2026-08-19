@@ -233,9 +233,9 @@ game-ai-rs
 ├─ game-ai-core       the Game trait above; zero dependencies on any
 │                      specific game
 ├─ game-ai-alphabeta   iterative-deepening negamax generic over
-│                      G: Game -- TT, quiescence, move ordering,
-│                      budgets, diagnostics (not yet migrated; see
-│                      Migration plan)
+│                      G: Game, H: SearchHooks<G> -- TT, quiescence,
+│                      move ordering, killers/history, root-policy
+│                      ordering, budgets, diagnostics
 └─ game-ai-arena       game-agnostic self-play/match tooling generic
                        over G: Game (not yet built)
 ```
@@ -281,19 +281,26 @@ Staged, per the acceptance gates that govern this extraction:
    `MoveFeatures`/`HISTORY_BUCKETS`. Separately (not a change to this
    repo, but a precondition for step 3): the Onitama-side dependency
    cycle is broken by extracting `onitama-search-domain`.
-3. Only once (2b) compiles cleanly for both games, and the Onitama
-   dependency graph has no cycle: migrate Onifish's actual alpha-beta/
-   TT/quiescence/move-ordering/diagnostics into `game-ai-alphabeta`,
-   generic over `G: Game, H: SearchHooks<G>`, consuming
-   `onitama-search-domain`'s `SearchHooks` implementor directly.
-   **Mechanical migration only** -- move the existing logic across,
-   don't clean it up algorithmically along the way, so any behavior
-   difference the frozen-position gate (step 4) catches has one
-   obvious cause, not "which of several simultaneous changes did it."
-   Run that gate after every meaningful slice of the migration, not
-   just once at the end -- and never edit the frozen fixture's
-   expected values to make a failing comparison pass; a mismatch means
-   the migration introduced a real behavior change to find and fix.
+3. **This commit**: only once (2b) compiles cleanly for both games,
+   and the Onitama dependency graph has no cycle, migrate Onifish's
+   actual alpha-beta engine -- config, diagnostics, score
+   normalization/budgets, TT, negamax, repetition handling, move
+   ordering, killers/history, quiescence, and root-policy ordering --
+   into `game-ai-alphabeta::engine`, generic over `G: Game, H:
+   SearchHooks<G>`. **Mechanical migration only** -- move the existing
+   logic across, don't clean it up algorithmically along the way, so
+   any behavior difference the frozen-position gate (step 4) catches
+   has one obvious cause, not "which of several simultaneous changes
+   did it." Notably: two spots where the original engine's exact
+   predicate is narrower or looser than a tidy reading of
+   `MoveFeatures` alone would suggest were preserved deliberately, not
+   "fixed" -- see `order_root_moves`'s and `negamax`'s cutoff-handling
+   doc comments in `engine.rs` (both keyed on `is_capture` specifically,
+   not `priority`/`is_noisy`, because that's what the original code
+   checked). This module's own tests cover the engine generically
+   against a toy game; byte-identical parity with the original engine
+   specifically is Onitama's job (a dual-engine parity test living in
+   `onitama-ai`, not here — see that crate's history).
 4. Re-run the positions frozen in (1) against the migrated engine at
    the same fixed depths -- move, score, node count, and PV must match
    exactly.
@@ -313,5 +320,6 @@ Staged, per the acceptance gates that govern this extraction:
    complete-game testing to run through the shared search instead of
    random moves).
 
-Steps 3-7 are the next phase of work -- not part of this commit, which
-only covers steps 1-2b.
+Steps 4-7 (running the parity gate, switching Onitama's public façade
+onto this engine, throughput/strength benchmarking, and deleting the
+original) happen in `onitama`, not here -- see that repo's history.
