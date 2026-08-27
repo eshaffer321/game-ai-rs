@@ -328,6 +328,17 @@ struct SearchContext<G: Game> {
     /// mode: the transposition table is a pure speed optimization and
     /// must never change which move or score a search returns.
     use_tt: bool,
+    /// One reusable move-list buffer per ply, indexed by `ply` (sized
+    /// `max_ply + 1`, matching `killers`). At any instant only the one
+    /// stack frame currently active at a given ply owns that buffer --
+    /// `negamax`/`quiescence` take it out with `mem::take` at the start
+    /// of their move-generation step and put it back right after their
+    /// move loop, before any sibling or later call at the same ply can
+    /// reuse the slot. `Vec::clear()` keeps the underlying allocation,
+    /// so after the first few nodes visited at a given ply, the buffer
+    /// stops growing and every later call at that ply generates moves
+    /// with zero new allocation.
+    move_buffers: Vec<Vec<G::Move>>,
 }
 
 fn check_limits<G: Game>(ctx: &mut SearchContext<G>) {
@@ -447,8 +458,11 @@ fn quiescence<G: Game, H: SearchHooks<G>>(
         return Some(stand_pat);
     }
 
+    let mut raw_moves = std::mem::take(&mut ctx.move_buffers[ply]);
+    G::legal_moves_into(state, &mut raw_moves);
     let mut noisy: Vec<G::Move> =
-        G::legal_moves(state).into_iter().filter(|mv| hooks.move_features(state, mv).is_noisy).collect();
+        raw_moves.iter().copied().filter(|mv| hooks.move_features(state, mv).is_noisy).collect();
+    ctx.move_buffers[ply] = raw_moves;
     if noisy.is_empty() {
         return Some(stand_pat);
     }
@@ -731,7 +745,8 @@ fn negamax<G: Game, H: SearchHooks<G>>(
         }
     }
 
-    let mut moves = G::legal_moves(state);
+    let mut moves = std::mem::take(&mut ctx.move_buffers[ply]);
+    G::legal_moves_into(state, &mut moves);
     let killers_at_ply = ctx.killers[ply];
     match (ply == 0, &ctx.root_policy) {
         (true, Some(root_policy)) => order_root_moves(hooks, &mut moves, state, tt_move, root_policy),
@@ -880,6 +895,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
         }
     }
 
+    ctx.move_buffers[ply] = moves;
     ctx.path.pop();
 
     if was_aborted {
@@ -1039,6 +1055,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             path: Vec::with_capacity(self.config.max_ply + 1),
             max_ply: self.config.max_ply,
             use_tt: self.config.tt_megabytes > 0,
+            move_buffers: vec![Vec::new(); self.config.max_ply + 1],
         };
 
         let mut best = AlphaBetaAnalysis {

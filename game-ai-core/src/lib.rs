@@ -40,6 +40,21 @@ pub trait Game {
     /// move is stalemated -- itself a loss, distinguished by `result`.
     fn legal_moves(state: &Self::State) -> Vec<Self::Move>;
 
+    /// Writes `legal_moves(state)`'s result into `out`, which is
+    /// cleared first. Behaviorally identical to `legal_moves` -- same
+    /// moves, same order -- but lets a caller (the search engine, in
+    /// particular) supply the same `Vec` across repeated calls so its
+    /// heap allocation is reused instead of a fresh one being made
+    /// every time. The default simply delegates to `legal_moves`, so
+    /// implementations that don't override this behave exactly as
+    /// before; only a game whose own move generation can write
+    /// directly into a caller's buffer needs to override it for the
+    /// allocation savings to materialize.
+    fn legal_moves_into(state: &Self::State, out: &mut Vec<Self::Move>) {
+        out.clear();
+        out.extend(Self::legal_moves(state));
+    }
+
     /// Applies `mv` (assumed legal -- callers should only ever pass
     /// moves produced by `legal_moves`) and returns the resulting
     /// state.
