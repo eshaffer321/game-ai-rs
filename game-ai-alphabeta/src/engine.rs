@@ -417,10 +417,12 @@ fn order_noisy_moves<G: Game, H: SearchHooks<G>>(hooks: &H, moves: &mut [G::Move
 /// alpha can never fall below) is a chess-search convention carried over
 /// as a heuristic approximation here, not a literal model of any
 /// specific game's forced-move rule.
+#[allow(clippy::too_many_arguments)]
 fn quiescence<G: Game, H: SearchHooks<G>>(
     hooks: &H,
     ctx: &mut SearchContext<G>,
     state: &G::State,
+    eval_state: &H::EvalState,
     mut alpha: i32,
     beta: i32,
     ply: usize,
@@ -447,7 +449,7 @@ fn quiescence<G: Game, H: SearchHooks<G>>(
         return Some(0);
     }
 
-    let stand_pat = hooks.evaluate(state);
+    let stand_pat = hooks.evaluate(state, eval_state);
     if stand_pat >= beta {
         return Some(stand_pat);
     }
@@ -473,7 +475,8 @@ fn quiescence<G: Game, H: SearchHooks<G>>(
     let mut was_aborted = false;
     for mv in noisy {
         let child = G::apply_move(state, mv);
-        let child_score = match quiescence(hooks, ctx, &child, -beta, -alpha, ply + 1, extra_ply_remaining - 1) {
+        let child_eval = hooks.child_eval_state(state, eval_state, &mv, &child);
+        let child_score = match quiescence(hooks, ctx, &child, &child_eval, -beta, -alpha, ply + 1, extra_ply_remaining - 1) {
             Some(s) => -s,
             None => {
                 was_aborted = true;
@@ -690,6 +693,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
     hooks: &H,
     ctx: &mut SearchContext<G>,
     state: &G::State,
+    eval_state: &H::EvalState,
     depth: u8,
     mut alpha: i32,
     beta: i32,
@@ -718,14 +722,14 @@ fn negamax<G: Game, H: SearchHooks<G>>(
     if ply >= ctx.max_ply {
         // Hard safety cutoff, independent of quiescence: never exceed the
         // configured absolute ply bound, regardless of search mode.
-        return Some((hooks.evaluate(state), None, false));
+        return Some((hooks.evaluate(state, eval_state), None, false));
     }
     if depth == 0 {
         // The normal iterative-deepening horizon — the only point
         // quiescence activates from.
         let score = match ctx.quiescence_max_extra_ply {
-            Some(extra_ply) => quiescence(hooks, ctx, state, alpha, beta, ply, extra_ply)?,
-            None => hooks.evaluate(state),
+            Some(extra_ply) => quiescence(hooks, ctx, state, eval_state, alpha, beta, ply, extra_ply)?,
+            None => hooks.evaluate(state, eval_state),
         };
         return Some((score, None, false));
     }
@@ -771,6 +775,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
     let mut path_dependent = false;
     for (i, mv) in moves.iter().enumerate() {
         let child = G::apply_move(state, *mv);
+        let child_eval = hooks.child_eval_state(state, eval_state, mv, &child);
         let lmr_eligible = ctx.lmr && is_lmr_eligible(hooks, state, mv, depth, i, tt_move, killers_at_ply);
         let child_score = if lmr_eligible {
             // LMR: a conservative subset of quiet, late moves gets tried
@@ -783,7 +788,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
             // does beat alpha isn't trusted as-is — it's always
             // re-searched at full depth before being accepted.
             ctx.lmr_reductions += 1;
-            let reduced = match negamax(hooks, ctx, &child, depth - 1 - LMR_REDUCTION, -beta, -alpha, ply + 1) {
+            let reduced = match negamax(hooks, ctx, &child, &child_eval, depth - 1 - LMR_REDUCTION, -beta, -alpha, ply + 1) {
                 Some((s, _, tainted)) => {
                     if tainted {
                         path_dependent = true;
@@ -797,7 +802,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
             };
             if reduced > alpha {
                 ctx.lmr_researches += 1;
-                match negamax(hooks, ctx, &child, depth - 1, -beta, -alpha, ply + 1) {
+                match negamax(hooks, ctx, &child, &child_eval, depth - 1, -beta, -alpha, ply + 1) {
                     Some((s, _, tainted)) => {
                         if tainted {
                             path_dependent = true;
@@ -824,7 +829,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
             // -- no special-casing needed.
             let use_scout = ctx.pvs && i > 0;
             let scout_score = if use_scout {
-                match negamax(hooks, ctx, &child, depth - 1, -alpha - 1, -alpha, ply + 1) {
+                match negamax(hooks, ctx, &child, &child_eval, depth - 1, -alpha - 1, -alpha, ply + 1) {
                     Some((s, _, tainted)) => {
                         if tainted {
                             path_dependent = true;
@@ -847,7 +852,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
                 if scout_score.is_some() {
                     ctx.pvs_researches += 1;
                 }
-                match negamax(hooks, ctx, &child, depth - 1, -beta, -alpha, ply + 1) {
+                match negamax(hooks, ctx, &child, &child_eval, depth - 1, -beta, -alpha, ply + 1) {
                     Some((s, _, tainted)) => {
                         if tainted {
                             path_dependent = true;
@@ -1078,6 +1083,12 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             principal_variation: Vec::new(),
         };
 
+        // Built once, before iterative deepening starts -- the root
+        // state doesn't change across depths, so neither does its eval
+        // state. Every node's eval state below this is incrementally
+        // derived from this one via `child_eval_state`.
+        let root_eval_state = self.hooks.init_eval_state(state);
+
         let mut aspiration_researches = 0u64;
         let mut depth: u8 = 1;
         loop {
@@ -1089,7 +1100,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 Some(window) if depth >= 2 => {
                     let alpha = best.score.saturating_sub(window).max(-MATE - 1);
                     let beta = best.score.saturating_add(window).min(MATE + 1);
-                    match negamax(&self.hooks, &mut ctx, state, depth, alpha, beta, 0) {
+                    match negamax(&self.hooks, &mut ctx, state, &root_eval_state, depth, alpha, beta, 0) {
                         Some((score, mv, tainted)) if score > alpha && score < beta => Some((score, mv, tainted)),
                         Some(_) => {
                             // Fail-low or fail-high: the narrow window only
@@ -1097,12 +1108,12 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                             // full-window re-search is needed for a result
                             // this depth can actually be trusted to report.
                             aspiration_researches += 1;
-                            negamax(&self.hooks, &mut ctx, state, depth, -MATE - 1, MATE + 1, 0)
+                            negamax(&self.hooks, &mut ctx, state, &root_eval_state, depth, -MATE - 1, MATE + 1, 0)
                         }
                         None => None,
                     }
                 }
-                _ => negamax(&self.hooks, &mut ctx, state, depth, -MATE - 1, MATE + 1, 0),
+                _ => negamax(&self.hooks, &mut ctx, state, &root_eval_state, depth, -MATE - 1, MATE + 1, 0),
             };
             let Some((score, root_move, _)) = result else {
                 break; // aborted mid-depth: discard, keep the previous depth's `best`
@@ -1168,6 +1179,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
     }
 
     fn analyze_depth_zero(&self, state: &G::State, legal: &[G::Move], start: Instant) -> AlphaBetaAnalysis<G> {
+        let root_eval_state = self.hooks.init_eval_state(state);
         let mut best_score = i32::MIN;
         let mut best_move = legal[0];
         for &mv in legal {
@@ -1181,7 +1193,10 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                     }
                 }
                 GameResult::Draw => 0,
-                GameResult::InProgress => -self.hooks.evaluate(&child),
+                GameResult::InProgress => {
+                    let child_eval = self.hooks.child_eval_state(state, &root_eval_state, &mv, &child);
+                    -self.hooks.evaluate(&child, &child_eval)
+                }
             };
             if score > best_score {
                 best_score = score;

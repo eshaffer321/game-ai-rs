@@ -71,7 +71,11 @@ struct NimHooks;
 impl SearchHooks<NimGame> for NimHooks {
     const HISTORY_BUCKETS: usize = 3;
 
-    fn evaluate(&self, state: &NimState) -> i32 {
+    type EvalState = ();
+
+    fn init_eval_state(&self, _state: &NimState) {}
+
+    fn evaluate(&self, state: &NimState, (): &()) -> i32 {
         // A pile that's a multiple of 3 is bad for the player to move
         // (under optimal play they'll eventually be forced to leave a
         // winning position for the opponent); otherwise good.

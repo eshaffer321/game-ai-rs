@@ -73,7 +73,13 @@ impl SearchHooks<NimGame> for NimHooks {
     // stand-in for Onitama's 625 (from, to) buckets.
     const HISTORY_BUCKETS: usize = 3;
 
-    fn evaluate(&self, state: &NimState) -> i32 {
+    // No incremental state to carry -- matches every other hand-tuned
+    // evaluator in this project.
+    type EvalState = ();
+
+    fn init_eval_state(&self, _state: &NimState) {}
+
+    fn evaluate(&self, state: &NimState, (): &()) -> i32 {
         if state.pile.is_multiple_of(self.prefer_multiple_of) { -1 } else { 1 }
     }
 
@@ -93,7 +99,8 @@ impl SearchHooks<NimGame> for NimHooks {
 }
 
 fn run_generically<G: Game, H: SearchHooks<G>>(hooks: &H, state: &G::State) -> i32 {
-    hooks.evaluate(state)
+    let eval_state = hooks.init_eval_state(state);
+    hooks.evaluate(state, &eval_state)
 }
 
 #[test]

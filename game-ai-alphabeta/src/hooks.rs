@@ -27,11 +27,46 @@ pub trait SearchHooks<G: Game> {
     /// dimension just to satisfy the shape.
     const HISTORY_BUCKETS: usize;
 
+    /// Whatever an implementor's evaluator needs to carry down the
+    /// search tree to avoid recomputing itself from scratch at every
+    /// node -- an NNUE accumulator, for instance. The search threads
+    /// this alongside `G::State` (see `init_eval_state`/
+    /// `child_eval_state` below) but never inspects it itself; only
+    /// `evaluate` reads it.
+    ///
+    /// A hand-tuned evaluator with nothing to carry incrementally
+    /// (Onitama's `EvalWeights`-based one, Santifish's linear one)
+    /// simply uses `()` here -- zero-sized, so threading it through
+    /// `negamax`/`quiescence` costs nothing, and both keep behaving
+    /// exactly as before this type existed.
+    type EvalState: Clone;
+
+    /// Builds the eval state for `state` from scratch. Called once,
+    /// at the search root, before iterative deepening begins -- never
+    /// per node. A game with `EvalState = ()` returns `()`.
+    fn init_eval_state(&self, state: &G::State) -> Self::EvalState;
+
+    /// Derives the eval state for the position reached by playing
+    /// `mv` at `parent_state` (whose eval state is `parent_eval`),
+    /// landing on `child_state`. The default recomputes from scratch
+    /// via `init_eval_state` -- correct for any implementor, and free
+    /// for `EvalState = ()`; only an implementor that actually wants
+    /// incremental updates (e.g. touching just the input features a
+    /// move changed, rather than rebuilding an accumulator from
+    /// scratch) needs to override this.
+    fn child_eval_state(&self, _parent_state: &G::State, _parent_eval: &Self::EvalState, _mv: &G::Move, child_state: &G::State) -> Self::EvalState {
+        self.init_eval_state(child_state)
+    }
+
     /// Static evaluation of `state`, from `G::current_player(state)`'s
-    /// perspective. Higher is better for the player to move. Never
-    /// called by a well-behaved search on a state where `G::result`
-    /// is not `InProgress`.
-    fn evaluate(&self, state: &G::State) -> i32;
+    /// perspective, given `state`'s already-current `eval_state`
+    /// (built via `init_eval_state`/`child_eval_state` on the path
+    /// that reached it -- the search guarantees this by construction,
+    /// never passing an eval state for any state other than the one it
+    /// was derived for). Higher is better for the player to move.
+    /// Never called by a well-behaved search on a state where
+    /// `G::result` is not `InProgress`.
+    fn evaluate(&self, state: &G::State, eval_state: &Self::EvalState) -> i32;
 
     /// Everything move ordering, quiescence, and the history table
     /// need to know about `mv`, played at `state`, computed together
