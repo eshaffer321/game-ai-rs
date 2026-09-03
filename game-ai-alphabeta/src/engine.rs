@@ -33,16 +33,18 @@ enum Bound {
 struct TtEntry<G: Game> {
     key: G::PositionKey,
     depth: u8,
-    // `bound`/`score` are written on every store but no longer read by
-    // `negamax` — TT entries are advisory-only (move-ordering hint via
-    // `best_move` only) since a cached score can't be trusted across
-    // different ancestor paths (the Graph History Interaction problem;
-    // see negamax's TT-probe comment). Kept, not deleted, because they're
-    // exactly the data a future path-aware authoritative TT would need;
-    // stripping them now would just mean re-adding them later.
-    #[allow(dead_code)]
+    // `bound`/`score` are written on every store; whether `negamax`
+    // reads them back depends on `SearchContext::authoritative_tt` --
+    // `false` (the default, and the only option for a game that
+    // hasn't set `Game::SUPPORTS_AUTHORITATIVE_TT`) keeps them
+    // write-only, since a cached score can't be trusted across
+    // different ancestor paths for a game whose positions can recur
+    // (the Graph History Interaction problem; see negamax's TT-probe
+    // comment). `true` is only reachable for a game that has proven
+    // its non-terminal positions can never recur (e.g. Santorini's
+    // `ProgressMeasure`), at which point a cached score is that
+    // position's one true, path-independent value.
     bound: Bound,
-    #[allow(dead_code)]
     score: i32,
     best_move: Option<G::Move>,
     generation: u32,
@@ -175,6 +177,17 @@ pub struct AlphaBetaConfig {
     /// produce byte-identical output -- this exists solely so callers
     /// can A/B the two for an equal-time arena screen.
     pub order_moves_use_cached_key: bool,
+    /// Enables *authoritative* TT use: a sufficiently-deep cached
+    /// entry can return early (`Bound::Exact`) or tighten alpha/beta
+    /// (`Bound::Lower`/`Bound::Upper`), not just seed move ordering.
+    /// Only meaningful, and only safe, when `G::SUPPORTS_AUTHORITATIVE_TT`
+    /// is `true` for the game being searched -- `AlphaBetaPlayer::new`
+    /// panics if this is `true` for a game that hasn't declared that
+    /// capability, rather than silently falling back to advisory-only
+    /// behavior. `false` (the default) matches every prior release:
+    /// TT entries are read for `best_move` only, exactly as before
+    /// this field existed.
+    pub authoritative_tt: bool,
 }
 
 /// See `AlphaBetaConfig::history_bonus`.
@@ -217,6 +230,7 @@ impl Default for AlphaBetaConfig {
             history_bonus: HistoryBonus::DepthSquared,
             lmr: false,
             order_moves_use_cached_key: true,
+            authoritative_tt: false,
         }
     }
 }
@@ -256,6 +270,10 @@ pub struct AlphaBetaAnalysis<G: Game> {
     pub quiescence_nodes: u64,
     pub tt_hits: u64,
     pub beta_cutoffs: u64,
+    /// Of `tt_hits`, how many caused an authoritative early return or
+    /// alpha/beta tightening that closed the window (0 unless
+    /// `AlphaBetaConfig::authoritative_tt` is enabled).
+    pub tt_cutoffs: u64,
     /// Number of times a PVS null-window scout suggested a move might
     /// beat alpha and had to be re-searched at the full window (0 if
     /// PVS is disabled).
@@ -297,6 +315,7 @@ struct SearchContext<G: Game> {
     quiescence_nodes: u64,
     tt_hits: u64,
     beta_cutoffs: u64,
+    tt_cutoffs: u64,
     pvs_researches: u64,
     lmr_reductions: u64,
     lmr_researches: u64,
@@ -307,6 +326,7 @@ struct SearchContext<G: Game> {
     history_bonus: HistoryBonus,
     lmr: bool,
     order_moves_use_cached_key: bool,
+    authoritative_tt: bool,
     /// Cached once per `analyze()` call (never re-requested across
     /// iterative-deepening depths) and consulted only at the root
     /// (`ply == 0`) — see `order_root_moves`. `None` means either no
@@ -651,11 +671,8 @@ fn score_to_tt(score: i32, ply: usize) -> i32 {
 }
 
 /// Inverse of `score_to_tt`: converts a stored ply-independent score back
-/// to what it means at the *current* node's ply. Not called in
-/// production now that TT scores are advisory-only and never read back
-/// (see `TtEntry::score`), but kept and unit-tested (round-tripping
-/// against `score_to_tt`) since a future path-aware TT would need it.
-#[allow(dead_code)]
+/// to what it means at the *current* node's ply. Only called when
+/// `SearchContext::authoritative_tt` is enabled -- see `TtEntry::score`.
 fn score_from_tt(score: i32, ply: usize) -> i32 {
     if score >= MATE_THRESHOLD {
         score - ply as i32
@@ -696,7 +713,7 @@ fn negamax<G: Game, H: SearchHooks<G>>(
     eval_state: &H::EvalState,
     depth: u8,
     mut alpha: i32,
-    beta: i32,
+    mut beta: i32,
     ply: usize,
 ) -> Option<(i32, Option<G::Move>, bool)> {
     check_limits(ctx);
@@ -735,17 +752,41 @@ fn negamax<G: Game, H: SearchHooks<G>>(
     }
 
     let orig_alpha = alpha;
-    // TT entries are advisory-only: `entry.best_move` seeds move ordering
-    // (an old best guess can only make search faster or slower to prove
-    // the same result), but a cached score is *never* used to return
-    // early or tighten alpha/beta -- see this function's own doc comment
-    // on `path_dependent` for why (the Graph History Interaction
-    // problem).
+    // TT entries are always read for move ordering (`entry.best_move`).
+    // When `ctx.authoritative_tt` is also enabled -- only reachable for
+    // a game that has proven its non-terminal positions can never
+    // recur, via `Game::SUPPORTS_AUTHORITATIVE_TT` (checked at
+    // `AlphaBetaPlayer::new`) -- a sufficiently-deep entry's cached
+    // score is used too: an `Exact` bound returns immediately, and a
+    // `Lower`/`Upper` bound tightens alpha/beta, cutting off here too
+    // if the window closes. For a game that hasn't proven this,
+    // `ctx.authoritative_tt` is always `false` and a cached score is
+    // *never* used to return early or tighten alpha/beta -- see this
+    // function's own doc comment on `path_dependent` for why (the
+    // Graph History Interaction problem: a cached score there depends
+    // on which ancestors happen to be on this specific search line,
+    // not just the position itself).
     let mut tt_move = None;
     if ctx.use_tt {
         if let Some(entry) = ctx.tt.probe(key) {
             ctx.tt_hits += 1;
             tt_move = entry.best_move;
+
+            if ctx.authoritative_tt && entry.depth >= depth {
+                let tt_score = score_from_tt(entry.score, ply);
+                match entry.bound {
+                    Bound::Exact => {
+                        ctx.tt_cutoffs += 1;
+                        return Some((tt_score, entry.best_move, false));
+                    }
+                    Bound::Lower => alpha = alpha.max(tt_score),
+                    Bound::Upper => beta = beta.min(tt_score),
+                }
+                if alpha >= beta {
+                    ctx.tt_cutoffs += 1;
+                    return Some((tt_score, entry.best_move, false));
+                }
+            }
         }
     }
 
@@ -948,6 +989,14 @@ pub struct AlphaBetaPlayer<G: Game, H: SearchHooks<G>> {
 
 impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
     pub fn new(config: AlphaBetaConfig, hooks: H) -> Self {
+        assert!(
+            !config.authoritative_tt || G::SUPPORTS_AUTHORITATIVE_TT,
+            "AlphaBetaConfig::authoritative_tt was requested, but this game does not declare \
+             Game::SUPPORTS_AUTHORITATIVE_TT -- authoritative TT reuse is only sound for a game \
+             that has proven its non-terminal positions can never recur within a game. Refusing \
+             to silently fall back to advisory-only behavior; either drop authoritative_tt or \
+             prove and declare the capability on this game's Game impl."
+        );
         let tt = TranspositionTable::new(config.tt_megabytes);
         AlphaBetaPlayer { config, hooks, tt }
     }
@@ -997,6 +1046,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 quiescence_nodes: 0,
                 tt_hits: 0,
                 beta_cutoffs: 0,
+                tt_cutoffs: 0,
                 pvs_researches: 0,
                 aspiration_researches: 0,
                 lmr_reductions: 0,
@@ -1043,6 +1093,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             quiescence_nodes: 0,
             tt_hits: 0,
             beta_cutoffs: 0,
+            tt_cutoffs: 0,
             pvs_researches: 0,
             lmr_reductions: 0,
             lmr_researches: 0,
@@ -1053,6 +1104,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             history_bonus: self.config.history_bonus,
             lmr: self.config.lmr,
             order_moves_use_cached_key: self.config.order_moves_use_cached_key,
+            authoritative_tt: self.config.authoritative_tt,
             root_policy,
             node_limit,
             deadline,
@@ -1072,6 +1124,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             quiescence_nodes: 0,
             tt_hits: 0,
             beta_cutoffs: 0,
+            tt_cutoffs: 0,
             pvs_researches: 0,
             aspiration_researches: 0,
             lmr_reductions: 0,
@@ -1128,6 +1181,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 quiescence_nodes: ctx.quiescence_nodes,
                 tt_hits: ctx.tt_hits,
                 beta_cutoffs: ctx.beta_cutoffs,
+                tt_cutoffs: ctx.tt_cutoffs,
                 pvs_researches: ctx.pvs_researches,
                 aspiration_researches,
                 lmr_reductions: ctx.lmr_reductions,
@@ -1170,6 +1224,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
         best.quiescence_nodes = ctx.quiescence_nodes;
         best.tt_hits = ctx.tt_hits; // same reasoning — keep hit-rate math consistent with `nodes`
         best.beta_cutoffs = ctx.beta_cutoffs;
+        best.tt_cutoffs = ctx.tt_cutoffs;
         best.pvs_researches = ctx.pvs_researches;
         best.lmr_reductions = ctx.lmr_reductions;
         best.lmr_researches = ctx.lmr_researches;
@@ -1212,6 +1267,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             quiescence_nodes: 0,
             tt_hits: 0,
             beta_cutoffs: 0,
+            tt_cutoffs: 0,
             pvs_researches: 0,
             aspiration_researches: 0,
             lmr_reductions: 0,

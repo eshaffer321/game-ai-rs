@@ -84,6 +84,30 @@ pub trait Game {
     /// which changes node counts and PVs even though the search
     /// itself is unchanged, breaking the frozen-position replay gate.
     fn tt_hash(key: &Self::PositionKey) -> u64;
+
+    /// Whether every non-terminal `Self::State` reachable during real
+    /// play is guaranteed to never recur -- i.e. no sequence of legal
+    /// moves can return to a position already seen earlier in the same
+    /// game. When `true`, a transposition-table entry's cached score
+    /// is that position's one true, path-independent minimax value,
+    /// and a search is free to use it *authoritatively* (an early
+    /// return, or tightening alpha/beta) rather than only as a
+    /// move-ordering hint.
+    ///
+    /// `false` by default, and a game must opt in explicitly, with a
+    /// proof -- getting this wrong produces *silently incorrect*
+    /// search results, not a crash. A game whose moves are reversible
+    /// (a piece can return to a square it already occupied) can let
+    /// the same non-terminal position recur later in the same game
+    /// with a different, history-dependent correct value (e.g. a draw
+    /// by repetition) -- such a game must never override this to
+    /// `true`. See `game-ai-alphabeta`'s `AlphaBetaConfig::
+    /// authoritative_tt` for the matching search-side opt-in (also
+    /// `false` by default, and checked against this capability at
+    /// `AlphaBetaPlayer::new` -- requesting authority for a game that
+    /// doesn't declare it safe here is a hard error, never a silent
+    /// fallback).
+    const SUPPORTS_AUTHORITATIVE_TT: bool = false;
 }
 
 /// The outcome of a game at a given state. `Draw` has no producer in

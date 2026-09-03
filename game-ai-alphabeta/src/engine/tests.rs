@@ -65,6 +65,60 @@ impl Game for NimGame {
     }
 }
 
+/// Identical rules to `NimGame`, kept as a separate type (rather than
+/// just setting the const on `NimGame` itself) so the negative guard
+/// test above can rely on `NimGame` staying at the trait's default
+/// (`false`) while this one exercises the authoritative-TT machinery
+/// positively. `pile` strictly decreases by 1 or 2 on every move and
+/// never increases -- genuinely acyclic, not just a test-fixture
+/// shortcut, the same shape as Santorini's own `ProgressMeasure` proof.
+struct AcyclicNimGame;
+
+impl Game for AcyclicNimGame {
+    type State = NimState;
+    type Move = u8;
+    type Player = NimPlayer;
+    type PositionKey = (u8, u8);
+
+    fn current_player(state: &Self::State) -> Self::Player {
+        NimGame::current_player(state)
+    }
+    fn other_player(player: Self::Player) -> Self::Player {
+        NimGame::other_player(player)
+    }
+    fn legal_moves(state: &Self::State) -> Vec<Self::Move> {
+        NimGame::legal_moves(state)
+    }
+    fn apply_move(state: &Self::State, mv: Self::Move) -> Self::State {
+        NimGame::apply_move(state, mv)
+    }
+    fn result(state: &Self::State) -> CoreResult<Self::Player> {
+        NimGame::result(state)
+    }
+    fn position_key(state: &Self::State) -> Self::PositionKey {
+        NimGame::position_key(state)
+    }
+    fn tt_hash(key: &Self::PositionKey) -> u64 {
+        NimGame::tt_hash(key)
+    }
+    const SUPPORTS_AUTHORITATIVE_TT: bool = true;
+}
+
+impl SearchHooks<AcyclicNimGame> for NimHooks {
+    const HISTORY_BUCKETS: usize = 3;
+    type EvalState = ();
+    fn init_eval_state(&self, _state: &NimState) {}
+    fn evaluate(&self, state: &NimState, (): &()) -> i32 {
+        <NimHooks as SearchHooks<NimGame>>::evaluate(self, state, &())
+    }
+    fn move_features(&self, state: &NimState, mv: &u8) -> MoveFeatures {
+        <NimHooks as SearchHooks<NimGame>>::move_features(self, state, mv)
+    }
+    fn has_immediate_threat(&self, state: &NimState, player: NimPlayer) -> bool {
+        <NimHooks as SearchHooks<NimGame>>::has_immediate_threat(self, state, player)
+    }
+}
+
 #[derive(Default)]
 struct NimHooks;
 
@@ -158,6 +212,61 @@ fn reset_for_new_game_clears_the_transposition_table_without_losing_config() {
     let after = player.analyze(&state, None);
     assert_eq!(before.best_move, after.best_move);
     assert_eq!(before.score, after.score);
+}
+
+#[test]
+#[should_panic(expected = "does not declare Game::SUPPORTS_AUTHORITATIVE_TT")]
+fn authoritative_tt_requested_for_a_game_that_does_not_declare_it_safe_panics_loudly() {
+    // NimGame doesn't override `SUPPORTS_AUTHORITATIVE_TT` (stays `false`,
+    // the trait default) -- requesting `authoritative_tt: true` for it
+    // must be a hard, loud failure at construction time, never a silent
+    // fallback to advisory-only behavior. This is the two-independent-
+    // gates mechanism itself, not any particular game's correctness.
+    let _: AlphaBetaPlayer<NimGame, NimHooks> =
+        AlphaBetaPlayer::new(AlphaBetaConfig { authoritative_tt: true, ..AlphaBetaConfig::default() }, NimHooks);
+}
+
+#[test]
+fn authoritative_tt_matches_tt_completely_disabled_across_many_piles_and_tiny_tables() {
+    // AcyclicNimGame declares SUPPORTS_AUTHORITATIVE_TT truthfully
+    // (pile strictly decreases every move). Comparing against TT
+    // completely disabled (tt_megabytes: 0), not merely advisory TT,
+    // is the most conservative ground truth: no move-ordering
+    // influence at all, so any score divergence can only come from
+    // the authoritative early-return/window-tightening logic itself.
+    // `tt_megabytes: 1` is the smallest size the API allows -- already
+    // small enough, relative to how few distinct positions Nim has,
+    // to exercise real collisions and replacement.
+    for pile in 1..=40u8 {
+        for to_move in [NimPlayer::A, NimPlayer::B] {
+            let state = NimState { pile, to_move };
+            for depth in [4u8, 10] {
+                let mut baseline: AlphaBetaPlayer<AcyclicNimGame, NimHooks> = AlphaBetaPlayer::new(
+                    AlphaBetaConfig { limit: SearchLimit::Depth(depth), tt_megabytes: 0, ..AlphaBetaConfig::default() },
+                    NimHooks,
+                );
+                let mut candidate: AlphaBetaPlayer<AcyclicNimGame, NimHooks> = AlphaBetaPlayer::new(
+                    AlphaBetaConfig {
+                        limit: SearchLimit::Depth(depth),
+                        tt_megabytes: 1,
+                        authoritative_tt: true,
+                        ..AlphaBetaConfig::default()
+                    },
+                    NimHooks,
+                );
+
+                let baseline_analysis = baseline.analyze(&state, None);
+                let candidate_analysis = candidate.analyze(&state, None);
+
+                assert_eq!(
+                    candidate_analysis.score, baseline_analysis.score,
+                    "pile {pile}, {to_move:?} to move, depth {depth}: authoritative TT diverged from TT-disabled \
+                     ({} -> {})",
+                    baseline_analysis.score, candidate_analysis.score
+                );
+            }
+        }
+    }
 }
 
 #[test]
