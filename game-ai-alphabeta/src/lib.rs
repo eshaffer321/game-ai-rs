@@ -7,7 +7,7 @@ mod engine;
 mod hooks;
 
 pub use engine::{
-    AlphaBetaAnalysis, AlphaBetaConfig, AlphaBetaPlayer, HistoryBonus, RootPolicyEvaluator, SearchLimit, MATE,
+    AlphaBetaAnalysis, AlphaBetaConfig, AlphaBetaPlayer, HistoryBonus, RfpConfig, RootPolicyEvaluator, SearchLimit, MATE,
 };
 pub use hooks::{MoveFeatures, MovePriority, SearchHooks};
 
