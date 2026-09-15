@@ -318,3 +318,190 @@ fn an_unusable_policy_falls_back_to_classical_ordering() {
     assert!(!analysis.root_policy_used);
     assert_eq!(analysis.best_move, 1); // still finds the true optimal move
 }
+
+// --- Reverse futility pruning ------------------------------------------
+
+#[test]
+fn rfp_is_none_by_default() {
+    assert!(AlphaBetaConfig::default().rfp.is_none());
+}
+
+/// Same rules as `NimHooks`, but `supports_reverse_futility_pruning`
+/// always returns `false` -- exercises the "a game excludes some
+/// phase/region from RFP entirely" path (Santorini's Setup phase is
+/// the real-world case) without needing a second real game.
+#[derive(Default)]
+struct PhaseExcludedHooks;
+
+impl SearchHooks<AcyclicNimGame> for PhaseExcludedHooks {
+    const HISTORY_BUCKETS: usize = 3;
+    type EvalState = ();
+    fn init_eval_state(&self, _state: &NimState) {}
+    fn evaluate(&self, state: &NimState, eval_state: &()) -> i32 {
+        <NimHooks as SearchHooks<AcyclicNimGame>>::evaluate(&NimHooks, state, eval_state)
+    }
+    fn move_features(&self, state: &NimState, mv: &u8) -> MoveFeatures {
+        <NimHooks as SearchHooks<AcyclicNimGame>>::move_features(&NimHooks, state, mv)
+    }
+    fn has_immediate_threat(&self, state: &NimState, player: NimPlayer) -> bool {
+        <NimHooks as SearchHooks<AcyclicNimGame>>::has_immediate_threat(&NimHooks, state, player)
+    }
+    fn supports_reverse_futility_pruning(&self, _state: &NimState) -> bool {
+        false
+    }
+}
+
+const TEST_RFP: RfpConfig = RfpConfig { max_depth: 8, base_margin: 100, margin_per_depth: 80, improving_bonus: 80 };
+
+fn eligible_baseline() -> (NimState, u8, i32, i32, usize) {
+    // pile=10: has_immediate_threat is false (pile > 2); depth=4 is
+    // within TEST_RFP's max_depth; alpha/beta are an ordinary
+    // non-PV (width-1) window nowhere near MATE_THRESHOLD; ply=3 is
+    // non-root. Every exclusion test below starts from this
+    // otherwise-eligible baseline and flips exactly one condition.
+    (NimState { pile: 10, to_move: NimPlayer::A }, 4, 0, 1, 3)
+}
+
+#[test]
+fn rfp_eligible_true_when_every_condition_holds() {
+    let (state, depth, alpha, beta, ply) = eligible_baseline();
+    assert!(rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, depth, alpha, beta));
+}
+
+#[test]
+fn rfp_eligible_excludes_root() {
+    let (state, depth, alpha, beta, _ply) = eligible_baseline();
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, 0, depth, alpha, beta));
+}
+
+#[test]
+fn rfp_eligible_excludes_pv_nodes() {
+    let (state, depth, _alpha, _beta, ply) = eligible_baseline();
+    // A window wider than one point is this engine's only signal for
+    // "PV node" (see `rfp_eligible`'s doc comment) -- (-10, 10) is a
+    // full/wide window, unlike the eligible baseline's (0, 1).
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, depth, -10, 10));
+}
+
+#[test]
+fn rfp_eligible_excludes_depth_beyond_the_configured_ceiling() {
+    let (state, _depth, alpha, beta, ply) = eligible_baseline();
+    assert!(rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, TEST_RFP.max_depth, alpha, beta));
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, TEST_RFP.max_depth + 1, alpha, beta));
+}
+
+#[test]
+fn rfp_eligible_excludes_beta_in_forced_mate_territory() {
+    let (state, depth, alpha, _beta, ply) = eligible_baseline();
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, depth, alpha, MATE_THRESHOLD));
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, depth, alpha, MATE_THRESHOLD + 500));
+}
+
+#[test]
+fn rfp_eligible_excludes_alpha_in_forced_mate_territory() {
+    let (state, depth, _alpha, beta, ply) = eligible_baseline();
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, depth, -MATE_THRESHOLD, beta));
+}
+
+#[test]
+fn rfp_eligible_excludes_immediate_threat() {
+    let (mut state, depth, alpha, beta, ply) = eligible_baseline();
+    state.pile = 2; // NimHooks::has_immediate_threat is `pile <= 2`
+    assert!(!rfp_eligible::<AcyclicNimGame, NimHooks>(&NimHooks, &state, &TEST_RFP, ply, depth, alpha, beta));
+}
+
+#[test]
+fn rfp_eligible_excludes_a_phase_the_hooks_deny() {
+    let (state, depth, alpha, beta, ply) = eligible_baseline();
+    assert!(!rfp_eligible::<AcyclicNimGame, PhaseExcludedHooks>(&PhaseExcludedHooks, &state, &TEST_RFP, ply, depth, alpha, beta));
+}
+
+#[test]
+fn rfp_disabled_produces_byte_identical_output_to_before_it_existed() {
+    // Every existing test above this point already runs with
+    // `AlphaBetaConfig::default()` (`rfp: None`) and continues to
+    // pass unchanged -- this test just makes the guarantee explicit
+    // and independent of any one of them being edited later.
+    let mut without_rfp_field_touched: AlphaBetaPlayer<NimGame, NimHooks> =
+        AlphaBetaPlayer::new(AlphaBetaConfig { limit: SearchLimit::Depth(8), ..AlphaBetaConfig::default() }, NimHooks);
+    let state = NimState { pile: 11, to_move: NimPlayer::A };
+    let analysis = without_rfp_field_touched.analyze(&state, None);
+    assert_eq!(analysis.rfp_attempts, 0);
+    assert_eq!(analysis.rfp_cutoffs, 0);
+    assert_eq!(analysis.best_move, 2); // leaves 9, a multiple of 3
+}
+
+#[test]
+fn rfp_attempts_and_cutoffs_are_recorded_separately_when_enabled() {
+    // A very tight (barely-permissive) margin: attempts happen at
+    // every eligible node, but only some of them actually cut off.
+    let mut player: AlphaBetaPlayer<AcyclicNimGame, NimHooks> = AlphaBetaPlayer::new(
+        AlphaBetaConfig {
+            limit: SearchLimit::Depth(10),
+            pvs: true, // needed for any non-root window to narrow at all -- see rfp_eligible's doc comment
+            rfp: Some(RfpConfig { max_depth: 10, base_margin: 1, margin_per_depth: 0, improving_bonus: 0 }),
+            ..AlphaBetaConfig::default()
+        },
+        NimHooks,
+    );
+    let state = NimState { pile: 15, to_move: NimPlayer::A };
+    let analysis = player.analyze(&state, None);
+    assert!(analysis.rfp_attempts > 0, "expected at least one RFP-eligible node in a depth-10 search");
+    assert!(analysis.rfp_cutoffs <= analysis.rfp_attempts, "cutoffs can never exceed attempts");
+}
+
+#[test]
+fn rfp_cutoff_does_not_write_an_exact_tt_entry() {
+    let hooks = NimHooks;
+    // An absurdly permissive margin: any finite eval clears it, so
+    // the very first eligible node cuts off unconditionally.
+    let rfp = RfpConfig { max_depth: 255, base_margin: i32::MIN / 4, margin_per_depth: 0, improving_bonus: 0 };
+    let root_state = NimState { pile: 10, to_move: NimPlayer::A };
+    let child_state = AcyclicNimGame::apply_move(&root_state, 1);
+    let max_ply = 64usize;
+
+    let mut ctx = SearchContext::<AcyclicNimGame> {
+        tt: TranspositionTable::new(1),
+        killers: vec![[None; 2]; max_ply + 1],
+        history: vec![0; <NimHooks as SearchHooks<AcyclicNimGame>>::HISTORY_BUCKETS],
+        nodes: 0,
+        quiescence_nodes: 0,
+        tt_hits: 0,
+        beta_cutoffs: 0,
+        tt_cutoffs: 0,
+        rfp_attempts: 0,
+        rfp_cutoffs: 0,
+        pvs_researches: 0,
+        lmr_reductions: 0,
+        lmr_researches: 0,
+        quiescence_max_extra_ply: None,
+        pvs: false,
+        killer_moves: false,
+        history_heuristic: false,
+        history_bonus: HistoryBonus::Flat,
+        lmr: false,
+        order_moves_use_cached_key: true,
+        authoritative_tt: false,
+        rfp: Some(rfp),
+        eval_history: vec![None; max_ply + 1],
+        root_policy: None,
+        node_limit: None,
+        deadline: None,
+        aborted: false,
+        path: Vec::new(),
+        max_ply,
+        use_tt: true,
+        move_buffers: vec![Vec::new(); max_ply + 1],
+    };
+
+    // ply=1, window (0, 1) -- non-root, non-PV (width 1) -- eligible.
+    let result = negamax(&hooks, &mut ctx, &child_state, &(), 4, 0, 1, 1);
+    assert!(result.is_some(), "search should not have aborted");
+    assert!(ctx.rfp_cutoffs > 0, "expected the absurdly permissive margin to force a cutoff");
+
+    let key = AcyclicNimGame::position_key(&child_state);
+    assert!(
+        ctx.tt.probe(key).is_none(),
+        "an RFP cutoff must not write a TT entry at all (the conservative choice over storing an inexact bound)"
+    );
+}

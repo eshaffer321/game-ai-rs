@@ -188,6 +188,38 @@ pub struct AlphaBetaConfig {
     /// TT entries are read for `best_move` only, exactly as before
     /// this field existed.
     pub authoritative_tt: bool,
+    /// Enables reverse futility pruning: at a shallow-enough remaining
+    /// depth, if the static eval already exceeds beta by more than a
+    /// depth-scaled margin, cut off without searching further -- see
+    /// `RfpConfig`. `None` (the default) disables it entirely, with
+    /// zero behavioral or performance cost: every constant is
+    /// score-scale-dependent (tuned against one particular evaluator's
+    /// output range), so a game must supply its own `RfpConfig`
+    /// rather than this crate hardcoding one.
+    pub rfp: Option<RfpConfig>,
+}
+
+/// Reverse futility pruning's tunable constants -- score-scale-
+/// dependent, so deliberately not hardcoded in this generic crate.
+/// Ported from `JPricey/santorini-ai`'s exact rule (its own constants:
+/// `max_depth: 8, base_margin: 100, margin_per_depth: 80,
+/// improving_bonus: 80`) rather than retuned from scratch; see
+/// `santorini-rs`'s `PRUNING_ABLATION_RESULT.md` for why this
+/// technique specifically was chosen first.
+#[derive(Clone, Copy, Debug)]
+pub struct RfpConfig {
+    /// Remaining-depth ceiling RFP is attempted at all.
+    pub max_depth: u8,
+    /// Flat margin term.
+    pub base_margin: i32,
+    /// Per-remaining-depth margin term.
+    pub margin_per_depth: i32,
+    /// Subtracted from the margin when the position is "improving"
+    /// (the static eval has gotten better for the side to move over
+    /// the last couple of plies) -- a smaller margin, more willing to
+    /// cut off, since an improving position is less likely to be a
+    /// static-eval mirage.
+    pub improving_bonus: i32,
 }
 
 /// See `AlphaBetaConfig::history_bonus`.
@@ -231,6 +263,7 @@ impl Default for AlphaBetaConfig {
             lmr: false,
             order_moves_use_cached_key: true,
             authoritative_tt: false,
+            rfp: None,
         }
     }
 }
@@ -274,6 +307,13 @@ pub struct AlphaBetaAnalysis<G: Game> {
     /// alpha/beta tightening that closed the window (0 unless
     /// `AlphaBetaConfig::authoritative_tt` is enabled).
     pub tt_cutoffs: u64,
+    /// Number of nodes where reverse futility pruning's eligibility
+    /// conditions all held and the margin check was actually
+    /// evaluated (0 unless `AlphaBetaConfig::rfp` is enabled).
+    pub rfp_attempts: u64,
+    /// Of `rfp_attempts`, how many actually cut off (the static eval
+    /// exceeded beta by more than the margin).
+    pub rfp_cutoffs: u64,
     /// Number of times a PVS null-window scout suggested a move might
     /// beat alpha and had to be re-searched at the full window (0 if
     /// PVS is disabled).
@@ -316,6 +356,8 @@ struct SearchContext<G: Game> {
     tt_hits: u64,
     beta_cutoffs: u64,
     tt_cutoffs: u64,
+    rfp_attempts: u64,
+    rfp_cutoffs: u64,
     pvs_researches: u64,
     lmr_reductions: u64,
     lmr_researches: u64,
@@ -327,6 +369,15 @@ struct SearchContext<G: Game> {
     lmr: bool,
     order_moves_use_cached_key: bool,
     authoritative_tt: bool,
+    rfp: Option<RfpConfig>,
+    /// Per-ply static eval, populated (and only ever consulted) when
+    /// `rfp` is `Some` -- see negamax's RFP block for why every node
+    /// needs its eval recorded, not just RFP-eligible ones (a
+    /// descendant several plies down may need an ancestor's eval for
+    /// its own "improving" check even if that ancestor was root, a PV
+    /// node, or beyond RFP's depth range). Empty (and never indexed)
+    /// when `rfp` is `None`.
+    eval_history: Vec<Option<i32>>,
     /// Cached once per `analyze()` call (never re-requested across
     /// iterative-deepening depths) and consulted only at the root
     /// (`ply == 0`) — see `order_root_moves`. `None` means either no
@@ -705,6 +756,51 @@ fn score_from_tt(score: i32, ply: usize) -> i32 {
 /// a path-dependent node's result must never be written to the TT, or a
 /// later, unrelated search could incorrectly inherit a draw score that
 /// only ever applied to one particular path.
+/// Every eligibility condition reverse futility pruning requires,
+/// independent of the eval-vs-margin check itself -- extracted from
+/// `negamax` so each exclusion can be unit-tested individually against
+/// synthetic inputs rather than only observable indirectly through a
+/// full search. `rfp.max_depth` bounds this to the same shallow
+/// remaining-depth range upstream restricts it to; `is_pv_node` is
+/// inferred the same way PVS already does (a window wider than one
+/// point) since this engine has no separate `NodeType` distinction;
+/// `mate_adjacent` disables it whenever alpha or beta already sits in
+/// forced-mate territory (reusing the same `MATE_THRESHOLD` the TT's
+/// own mate-score normalization uses), since the margin arithmetic
+/// below isn't meaningful against a score that's already a mate bound
+/// rather than a heuristic estimate.
+#[allow(clippy::too_many_arguments)]
+fn rfp_eligible<G: Game, H: SearchHooks<G>>(
+    hooks: &H,
+    state: &G::State,
+    rfp: &RfpConfig,
+    ply: usize,
+    depth: u8,
+    alpha: i32,
+    beta: i32,
+) -> bool {
+    if ply == 0 {
+        return false; // never at the root
+    }
+    let is_pv_node = beta - alpha > 1;
+    if is_pv_node {
+        return false;
+    }
+    if depth > rfp.max_depth {
+        return false;
+    }
+    let mate_adjacent = beta.abs() >= MATE_THRESHOLD || alpha.abs() >= MATE_THRESHOLD;
+    if mate_adjacent {
+        return false;
+    }
+    if !hooks.supports_reverse_futility_pruning(state) {
+        return false;
+    }
+    let mover = G::current_player(state);
+    let opponent = G::other_player(mover);
+    !hooks.has_immediate_threat(state, mover) && !hooks.has_immediate_threat(state, opponent)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn negamax<G: Game, H: SearchHooks<G>>(
     hooks: &H,
@@ -786,6 +882,52 @@ fn negamax<G: Game, H: SearchHooks<G>>(
                     ctx.tt_cutoffs += 1;
                     return Some((tt_score, entry.best_move, false));
                 }
+            }
+        }
+    }
+
+    // Reverse futility pruning: ported from JPricey/santorini-ai's
+    // exact rule (see `RfpConfig`'s doc comment). `ctx.rfp` is `None`
+    // unless a game's config explicitly enables it, so this whole
+    // block -- including the extra `hooks.evaluate` call every node
+    // pays once enabled -- costs nothing otherwise.
+    //
+    // The eval is computed and recorded here for *every* node reached
+    // while RFP is enabled, not just RFP-eligible ones: a descendant
+    // several plies down needs an ancestor's eval for its own
+    // "improving" check even when that ancestor was root, a PV node,
+    // or beyond RFP's own depth range -- matching upstream, which
+    // computes its static eval unconditionally per node and only
+    // gates the RFP *check* itself on root/PV/depth.
+    if let Some(rfp) = ctx.rfp {
+        let eval = hooks.evaluate(state, eval_state);
+        ctx.eval_history[ply] = Some(eval);
+
+        if rfp_eligible(hooks, state, &rfp, ply, depth, alpha, beta) {
+            let improving = if ply >= 4 {
+                ctx.eval_history[ply - 4]
+            } else if ply >= 2 {
+                ctx.eval_history[ply - 2]
+            } else {
+                None
+            }
+            .map(|prev_eval| eval > prev_eval)
+            .unwrap_or(true);
+
+            ctx.rfp_attempts += 1;
+            let margin = rfp.base_margin + rfp.margin_per_depth * depth as i32 - if improving { rfp.improving_bonus } else { 0 };
+            if eval - margin >= beta {
+                // A cutoff here only proves the position is at least
+                // `beta` -- a lower bound, not the position's exact
+                // minimax value -- so it must never be stored as an
+                // `Exact` TT entry. Returning early, before this
+                // function's own `ctx.tt.store(...)` call at the
+                // bottom, means it simply isn't stored at all, the
+                // conservative option (`RfpConfig`'s own doc comment:
+                // skip the TT write rather than risk storing a bound
+                // as if it were exact).
+                ctx.rfp_cutoffs += 1;
+                return Some((beta, None, false));
             }
         }
     }
@@ -1047,6 +1189,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 tt_hits: 0,
                 beta_cutoffs: 0,
                 tt_cutoffs: 0,
+                rfp_attempts: 0,
+                rfp_cutoffs: 0,
                 pvs_researches: 0,
                 aspiration_researches: 0,
                 lmr_reductions: 0,
@@ -1094,6 +1238,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             tt_hits: 0,
             beta_cutoffs: 0,
             tt_cutoffs: 0,
+            rfp_attempts: 0,
+            rfp_cutoffs: 0,
             pvs_researches: 0,
             lmr_reductions: 0,
             lmr_researches: 0,
@@ -1105,6 +1251,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             lmr: self.config.lmr,
             order_moves_use_cached_key: self.config.order_moves_use_cached_key,
             authoritative_tt: self.config.authoritative_tt,
+            rfp: self.config.rfp,
+            eval_history: if self.config.rfp.is_some() { vec![None; self.config.max_ply + 1] } else { Vec::new() },
             root_policy,
             node_limit,
             deadline,
@@ -1125,6 +1273,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             tt_hits: 0,
             beta_cutoffs: 0,
             tt_cutoffs: 0,
+            rfp_attempts: 0,
+            rfp_cutoffs: 0,
             pvs_researches: 0,
             aspiration_researches: 0,
             lmr_reductions: 0,
@@ -1182,6 +1332,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 tt_hits: ctx.tt_hits,
                 beta_cutoffs: ctx.beta_cutoffs,
                 tt_cutoffs: ctx.tt_cutoffs,
+                rfp_attempts: ctx.rfp_attempts,
+                rfp_cutoffs: ctx.rfp_cutoffs,
                 pvs_researches: ctx.pvs_researches,
                 aspiration_researches,
                 lmr_reductions: ctx.lmr_reductions,
@@ -1225,6 +1377,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
         best.tt_hits = ctx.tt_hits; // same reasoning — keep hit-rate math consistent with `nodes`
         best.beta_cutoffs = ctx.beta_cutoffs;
         best.tt_cutoffs = ctx.tt_cutoffs;
+        best.rfp_attempts = ctx.rfp_attempts;
+        best.rfp_cutoffs = ctx.rfp_cutoffs;
         best.pvs_researches = ctx.pvs_researches;
         best.lmr_reductions = ctx.lmr_reductions;
         best.lmr_researches = ctx.lmr_researches;
@@ -1268,6 +1422,8 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             tt_hits: 0,
             beta_cutoffs: 0,
             tt_cutoffs: 0,
+            rfp_attempts: 0,
+            rfp_cutoffs: 0,
             pvs_researches: 0,
             aspiration_researches: 0,
             lmr_reductions: 0,

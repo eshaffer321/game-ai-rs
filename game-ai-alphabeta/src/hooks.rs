@@ -85,6 +85,21 @@ pub trait SearchHooks<G: Game> {
     /// sharp position is exactly where a shallow trial search is most
     /// likely to misjudge a quiet move's value.
     fn has_immediate_threat(&self, state: &G::State, player: G::Player) -> bool;
+
+    /// Whether `state` is in a phase/region of the game reverse
+    /// futility pruning is safe to attempt at all (see
+    /// `AlphaBetaConfig::rfp`) -- independent of the per-node
+    /// depth/PV/immediate-threat gating the search itself always
+    /// applies. `true` by default, matching every game without
+    /// distinct phases (a game with phases -- e.g. Santorini's
+    /// placement phase, where the position isn't yet in the regime the
+    /// evaluator and pruning constants were tuned against -- should
+    /// override this to exclude whichever phase(s) the technique's
+    /// origin doesn't itself apply it to). Irrelevant, and never
+    /// called, when `AlphaBetaConfig::rfp` is `None`.
+    fn supports_reverse_futility_pruning(&self, _state: &G::State) -> bool {
+        true
+    }
 }
 
 /// A move's role in ordering, quiescence, and history -- one call's
