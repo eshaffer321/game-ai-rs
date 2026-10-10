@@ -9,6 +9,8 @@ use super::*;
 use crate::{MoveFeatures, MovePriority, SearchHooks};
 use game_ai_core::GameResult as CoreResult;
 
+mod iir;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum NimPlayer {
     A,
@@ -471,6 +473,7 @@ fn rfp_cutoff_does_not_write_an_exact_tt_entry() {
         tt_cutoffs: 0,
         rfp_attempts: 0,
         rfp_cutoffs: 0,
+        iir_reductions: 0,
         pvs_researches: 0,
         lmr_reductions: 0,
         lmr_researches: 0,
@@ -483,6 +486,7 @@ fn rfp_cutoff_does_not_write_an_exact_tt_entry() {
         order_moves_use_cached_key: true,
         authoritative_tt: false,
         rfp: Some(rfp),
+        iir: false,
         eval_history: vec![None; max_ply + 1],
         root_policy: None,
         node_limit: None,

@@ -100,6 +100,13 @@ pub trait SearchHooks<G: Game> {
     fn supports_reverse_futility_pruning(&self, _state: &G::State) -> bool {
         true
     }
+
+    /// Explicit per-game/per-phase permission for internal iterative
+    /// reduction. The algorithm is an approximation, so implementors
+    /// must opt in; existing games pay no cost while `config.iir` is off.
+    fn supports_internal_iterative_reduction(&self, _state: &G::State) -> bool {
+        false
+    }
 }
 
 /// A move's role in ordering, quiescence, and history -- one call's

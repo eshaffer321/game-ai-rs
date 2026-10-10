@@ -197,6 +197,13 @@ pub struct AlphaBetaConfig {
     /// output range), so a game must supply its own `RfpConfig`
     /// rather than this crate hardcoding one.
     pub rfp: Option<RfpConfig>,
+    /// On a TT miss at a non-root node with at least four plies left,
+    /// reduce the remaining depth by one. This is selective search:
+    /// completed nominal depth no longer promises full-depth minimax.
+    /// Requires the hooks to opt in for the current phase, and never
+    /// reduces a node with an immediate winning threat for either side.
+    /// Disabled by default; independent of PVS and RFP.
+    pub iir: bool,
 }
 
 /// Reverse futility pruning's tunable constants -- score-scale-
@@ -264,6 +271,7 @@ impl Default for AlphaBetaConfig {
             order_moves_use_cached_key: true,
             authoritative_tt: false,
             rfp: None,
+            iir: false,
         }
     }
 }
@@ -314,6 +322,9 @@ pub struct AlphaBetaAnalysis<G: Game> {
     /// Of `rfp_attempts`, how many actually cut off (the static eval
     /// exceeded beta by more than the margin).
     pub rfp_cutoffs: u64,
+    /// Nodes whose remaining depth was reduced by internal iterative
+    /// reduction after a TT miss (zero when IIR is disabled).
+    pub iir_reductions: u64,
     /// Number of times a PVS null-window scout suggested a move might
     /// beat alpha and had to be re-searched at the full window (0 if
     /// PVS is disabled).
@@ -358,6 +369,7 @@ struct SearchContext<G: Game> {
     tt_cutoffs: u64,
     rfp_attempts: u64,
     rfp_cutoffs: u64,
+    iir_reductions: u64,
     pvs_researches: u64,
     lmr_reductions: u64,
     lmr_researches: u64,
@@ -370,6 +382,7 @@ struct SearchContext<G: Game> {
     order_moves_use_cached_key: bool,
     authoritative_tt: bool,
     rfp: Option<RfpConfig>,
+    iir: bool,
     /// Per-ply static eval, populated (and only ever consulted) when
     /// `rfp` is `Some` -- see negamax's RFP block for why every node
     /// needs its eval recorded, not just RFP-eligible ones (a
@@ -801,13 +814,31 @@ fn rfp_eligible<G: Game, H: SearchHooks<G>>(
     !hooks.has_immediate_threat(state, mover) && !hooks.has_immediate_threat(state, opponent)
 }
 
+/// The upstream IIR rule is non-root, depth >= 4, and no TT entry.
+/// Unlike the upstream engine we do not extend threatened positions,
+/// so exclude them rather than spending one less ply on a forced block.
+fn iir_eligible<G: Game, H: SearchHooks<G>>(
+    hooks: &H,
+    state: &G::State,
+    ply: usize,
+    depth: u8,
+    tt_hit: bool,
+) -> bool {
+    ply > 0
+        && depth >= 4
+        && !tt_hit
+        && hooks.supports_internal_iterative_reduction(state)
+        && !hooks.has_immediate_threat(state, G::current_player(state))
+        && !hooks.has_immediate_threat(state, G::other_player(G::current_player(state)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn negamax<G: Game, H: SearchHooks<G>>(
     hooks: &H,
     ctx: &mut SearchContext<G>,
     state: &G::State,
     eval_state: &H::EvalState,
-    depth: u8,
+    mut depth: u8,
     mut alpha: i32,
     mut beta: i32,
     ply: usize,
@@ -863,8 +894,10 @@ fn negamax<G: Game, H: SearchHooks<G>>(
     // on which ancestors happen to be on this specific search line,
     // not just the position itself).
     let mut tt_move = None;
+    let mut tt_hit = false;
     if ctx.use_tt {
         if let Some(entry) = ctx.tt.probe(key) {
+            tt_hit = true;
             ctx.tt_hits += 1;
             tt_move = entry.best_move;
 
@@ -884,6 +917,14 @@ fn negamax<G: Game, H: SearchHooks<G>>(
                 }
             }
         }
+    }
+
+    // Probe at the originally requested depth first. Even a shallow
+    // entry suppresses IIR: it supplies evidence that this position has
+    // already been explored. A disabled TT is an actual miss.
+    if ctx.iir && iir_eligible(hooks, state, ply, depth, tt_hit) {
+        depth -= 1;
+        ctx.iir_reductions += 1;
     }
 
     // Reverse futility pruning: ported from JPricey/santorini-ai's
@@ -1098,6 +1139,8 @@ fn negamax<G: Game, H: SearchHooks<G>>(
         } else {
             Bound::Exact
         };
+        // `depth` is the depth actually searched after any IIR reduction.
+        // Never advertise a reduced result at the unreduced depth.
         ctx.tt.store(key, depth, bound, score_to_tt(best_score, ply), best_move);
     }
 
@@ -1191,6 +1234,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 tt_cutoffs: 0,
                 rfp_attempts: 0,
                 rfp_cutoffs: 0,
+                iir_reductions: 0,
                 pvs_researches: 0,
                 aspiration_researches: 0,
                 lmr_reductions: 0,
@@ -1240,6 +1284,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             tt_cutoffs: 0,
             rfp_attempts: 0,
             rfp_cutoffs: 0,
+            iir_reductions: 0,
             pvs_researches: 0,
             lmr_reductions: 0,
             lmr_researches: 0,
@@ -1252,6 +1297,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             order_moves_use_cached_key: self.config.order_moves_use_cached_key,
             authoritative_tt: self.config.authoritative_tt,
             rfp: self.config.rfp,
+            iir: self.config.iir,
             eval_history: if self.config.rfp.is_some() { vec![None; self.config.max_ply + 1] } else { Vec::new() },
             root_policy,
             node_limit,
@@ -1275,6 +1321,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             tt_cutoffs: 0,
             rfp_attempts: 0,
             rfp_cutoffs: 0,
+            iir_reductions: 0,
             pvs_researches: 0,
             aspiration_researches: 0,
             lmr_reductions: 0,
@@ -1334,6 +1381,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
                 tt_cutoffs: ctx.tt_cutoffs,
                 rfp_attempts: ctx.rfp_attempts,
                 rfp_cutoffs: ctx.rfp_cutoffs,
+                iir_reductions: ctx.iir_reductions,
                 pvs_researches: ctx.pvs_researches,
                 aspiration_researches,
                 lmr_reductions: ctx.lmr_reductions,
@@ -1379,6 +1427,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
         best.tt_cutoffs = ctx.tt_cutoffs;
         best.rfp_attempts = ctx.rfp_attempts;
         best.rfp_cutoffs = ctx.rfp_cutoffs;
+        best.iir_reductions = ctx.iir_reductions;
         best.pvs_researches = ctx.pvs_researches;
         best.lmr_reductions = ctx.lmr_reductions;
         best.lmr_researches = ctx.lmr_researches;
@@ -1424,6 +1473,7 @@ impl<G: Game, H: SearchHooks<G>> AlphaBetaPlayer<G, H> {
             tt_cutoffs: 0,
             rfp_attempts: 0,
             rfp_cutoffs: 0,
+            iir_reductions: 0,
             pvs_researches: 0,
             aspiration_researches: 0,
             lmr_reductions: 0,
